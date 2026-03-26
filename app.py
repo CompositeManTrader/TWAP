@@ -1,25 +1,28 @@
 """
 TWAP Monitor — Mesa de Capitales
-Fórmulas exactas del Excel:
-  C10 = (hora_meta - hora_orden) * 1440
-  C12 = HOUR(NOW-hora_orden)*60 + MINUTE(...)   -> int
-  C13 = vol_original / C10 * C12               -> TWAP esperado
-  C15 = C13 - asignado                         -> Por Asignar (neg=adelantado)
-  F14 = C10 / mins_periodo
-  F15 = vol_original / F14
-  F16 = ROUNDUP(C12 / mins_periodo, 0)
-  F17 = F16 * F15
-  F20 = F17 - asignado
+Fórmulas EXACTAS del Excel (verificadas):
+  C10 = (hora_meta - hora_orden) * 1440             -> Mins totales
+  C11 = NOW() - hora_orden                          -> Tiempo transcurrido
+  C12 = HOUR(C11)*60 + MINUTE(C11)                  -> Mins transcurridos (int)
+  C13 = vol_original / C10 * C12                     -> TWAP esperado
+  C15 = C13 - asignado                              -> Por Asignar
+  F5  = mins_periodo                                 -> input
+  F14 = C10 / F5                                     -> Total periodos
+  F15 = vol_original / F14                           -> Vol por periodo
+  F16 = ROUNDUP(C12 / F5, 0)                        -> Periodos transcurridos
+  F17 = F16 * F15                                    -> TWAP periodos
+  F18 = asignado                                     -> Asignado
+  F19 = F18 / F15                                    -> Asignado en periodos
+  F20 = F17 - F18                                    -> Por Asignar periodos
 """
 
 import streamlit as st
 from datetime import datetime, time, date, timedelta, timezone
-import math, json
+import math, json, os
 
-# ── Zona horaria CDMX (UTC-6) ─────────────────────────────────────────────
-# Usamos offset fijo UTC-6 para no depender de pytz/zoneinfo en todos los entornos.
-# México Central es UTC-6 (no hay horario de verano desde 2023).
+# ── Zona horaria CDMX (UTC-6, sin DST desde 2023) ─────────────────────────
 CDMX_TZ = timezone(timedelta(hours=-6))
+DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "twap_data.json")
 
 st.set_page_config(
     page_title="TWAP Monitor",
@@ -28,12 +31,9 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ── Auto-refresh cada 30 segundos para hora en tiempo real ─────────────────
-# Usamos un meta-refresh en <head> que sí funciona en Streamlit
-# (el script tag a veces es bloqueado)
-if "refresh_counter" not in st.session_state:
-    st.session_state.refresh_counter = 0
-
+# ════════════════════════════════════════════════════════════════════════════
+# FIX 1: PERSISTENCIA — Guardar/Cargar de archivo JSON
+# ════════════════════════════════════════════════════════════════════════════
 DEFAULTS = [{
     "nombre": "VOLARA",
     "tipo": "COMPRA",
@@ -45,14 +45,30 @@ DEFAULTS = [{
     "mins_periodo": 10,
 }]
 
+def _load_from_disk():
+    try:
+        with open(DATA_FILE, "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+def _save_to_disk(data):
+    with open(DATA_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
 def load_emisoras():
     if "emisoras" not in st.session_state:
-        st.session_state.emisoras = json.loads(json.dumps(DEFAULTS))
+        disk = _load_from_disk()
+        st.session_state.emisoras = disk if disk is not None else json.loads(json.dumps(DEFAULTS))
     return st.session_state.emisoras
 
 def save_emisoras(data):
     st.session_state.emisoras = data
+    _save_to_disk(data)
 
+# ════════════════════════════════════════════════════════════════════════════
+# UTILIDADES
+# ════════════════════════════════════════════════════════════════════════════
 def parse_time(s: str) -> time:
     parts = s.split(":")
     return time(int(parts[0]), int(parts[1]), int(parts[2]) if len(parts) > 2 else 0)
@@ -61,49 +77,71 @@ def fmt_time(t: time) -> str:
     return t.strftime("%H:%M:%S")
 
 def now_cdmx() -> datetime:
-    """Hora actual en CDMX, siempre."""
-    return datetime.now(CDMX_TZ).replace(tzinfo=None)  # naive pero en hora CDMX
+    return datetime.now(CDMX_TZ).replace(tzinfo=None)
 
 def calc_twap(e: dict, ahora: datetime) -> dict:
+    """Replica EXACTA de las fórmulas del Excel."""
     ho = datetime.combine(ahora.date(), parse_time(e["hora_orden"]))
     hm = datetime.combine(ahora.date(), parse_time(e["hora_meta"]))
     if hm <= ho:
         hm += timedelta(days=1)
+
     vol  = float(e["vol_original"])
     asig = float(e["asignado"])
     mp   = int(e["mins_periodo"])
-    mins_total = (hm - ho).total_seconds() / 60.0
 
-    # Tiempo transcurrido limitado al rango [0, mins_total]
-    diff_s = max(0.0, min((ahora - ho).total_seconds(), mins_total * 60))
-    total_sec = int(diff_s)
-    c12 = (total_sec // 3600) * 60 + (total_sec % 3600) // 60
+    # C9:  Tiempo Total = hora_meta - hora_orden
+    tiempo_total_sec = (hm - ho).total_seconds()
+    # C10: Mins = (hora_meta - hora_orden) * 1440
+    c10 = tiempo_total_sec / 60.0
 
-    # ══ FIX 1: TWAP esperado NUNCA puede superar vol_original ══
-    twap_min_raw = (vol / mins_total * c12) if mins_total > 0 else 0.0
-    twap_min = min(twap_min_raw, vol)  # <-- CAP al volumen original
+    # C11: Tiempo Transcurrido = NOW() - hora_orden
+    c11_sec = (ahora - ho).total_seconds()
 
-    por_asignar_min = twap_min - asig
+    # CLAMP: si aún no empieza o ya terminó
+    if c11_sec < 0:
+        c11_sec = 0.0
+    elif c11_sec > tiempo_total_sec:
+        c11_sec = tiempo_total_sec
 
-    total_periodos   = mins_total / mp if mp > 0 else 0.0
-    vol_por_periodo  = vol / total_periodos if total_periodos > 0 else 0.0
-    periodos_trans   = math.ceil(c12 / mp) if (mp > 0 and c12 > 0) else 0
+    # C12: = HOUR(C11)*60 + MINUTE(C11)   (Excel trunca segundos)
+    c11_hours = int(c11_sec // 3600)
+    c11_mins  = int((c11_sec % 3600) // 60)
+    c12 = c11_hours * 60 + c11_mins
 
-    twap_per_raw     = periodos_trans * vol_por_periodo
-    twap_per         = min(twap_per_raw, vol)  # <-- CAP al volumen original
+    # C13: TWAP = vol / C10 * C12
+    c13 = (vol / c10 * c12) if c10 > 0 else 0.0
+    c13 = min(c13, vol)  # CAP
 
-    asig_en_periodos = asig / vol_por_periodo if vol_por_periodo > 0 else 0.0
-    por_asignar_per  = twap_per - asig
+    # C15: Por Asignar = C13 - Asignado
+    c15 = c13 - asig
 
-    pct_tiempo = c12 / mins_total if mins_total > 0 else 0.0
+    # ── Periodos ──
+    f14 = c10 / mp if mp > 0 else 0.0
+    f15 = vol / f14 if f14 > 0 else 0.0
+    f16 = math.ceil(c12 / mp) if (mp > 0 and c12 > 0) else 0
+    f17 = min(f16 * f15, vol)  # CAP
+    f18 = asig
+    f19 = f18 / f15 if f15 > 0 else 0.0
+    f20 = f17 - f18
+
+    pct_tiempo = c12 / c10 if c10 > 0 else 0.0
     pct_asig   = asig / vol if vol > 0 else 0.0
+
+    def sec_to_hms(s):
+        s = int(abs(s))
+        return f"{s//3600:02d}:{(s%3600)//60:02d}:{s%60:02d}"
+
     return dict(
-        mins_total=mins_total, c12=c12,
+        c10=c10, c12=c12, c13=c13, c15=c15,
+        f14=f14, f15=f15, f16=f16, f17=f17, f18=f18, f19=f19, f20=f20,
         pct_tiempo=pct_tiempo, pct_asig=pct_asig,
-        twap_min=twap_min, por_asignar_min=por_asignar_min,
-        total_periodos=total_periodos, vol_por_periodo=vol_por_periodo,
-        periodos_trans=periodos_trans, twap_per=twap_per,
-        asig_en_periodos=asig_en_periodos, por_asignar_per=por_asignar_per,
+        tiempo_total_hms=sec_to_hms(tiempo_total_sec),
+        tiempo_trans_hms=sec_to_hms(c11_sec),
+        mins_total=c10, twap_min=c13, por_asignar_min=c15,
+        total_periodos=f14, vol_por_periodo=f15,
+        periodos_trans=f16, twap_per=f17,
+        asig_en_periodos=f19, por_asignar_per=f20,
     )
 
 def get_status(v: float):
@@ -143,7 +181,6 @@ html, body,
   font-family: 'Space Grotesk', sans-serif !important;
 }
 
-/* ══ FIX 2: Forzar sidebar visible ══ */
 [data-testid="stSidebar"] {
   background: var(--bg1) !important;
   border-right: 1px solid var(--bdr) !important;
@@ -151,20 +188,13 @@ html, body,
   width: 340px !important;
 }
 [data-testid="stSidebar"][aria-expanded="false"] {
-  min-width: 340px !important;
-  width: 340px !important;
-  margin-left: 0 !important;
-  transform: none !important;
+  min-width: 340px !important; width: 340px !important;
+  margin-left: 0 !important; transform: none !important;
 }
-[data-testid="stSidebar"] > div:first-child {
-  padding-top: 1rem !important;
-}
-[data-testid="stSidebar"] * {
-  font-family: 'Space Grotesk', sans-serif !important;
-}
+[data-testid="stSidebar"] > div:first-child { padding-top: 1rem !important; }
+[data-testid="stSidebar"] * { font-family: 'Space Grotesk', sans-serif !important; }
 #MainMenu, footer, header, [data-testid="stDecoration"] { display: none !important; }
 
-/* Sidebar text colors fix */
 [data-testid="stSidebar"] p,
 [data-testid="stSidebar"] span,
 [data-testid="stSidebar"] div { color: var(--text) !important; }
@@ -182,8 +212,6 @@ html, body,
   color: var(--text) !important; border-radius: 8px !important;
 }
 
-/* Tabs */
-[data-testid="stTabs"] { border-bottom: 1px solid var(--bdr) !important; }
 button[data-baseweb="tab"] {
   font-family: 'Space Grotesk', sans-serif !important;
   font-size: 14px !important; font-weight: 600 !important;
@@ -195,7 +223,29 @@ button[data-baseweb="tab"][aria-selected="true"] {
   border-bottom: 2px solid var(--acc) !important;
 }
 
-/* Main inputs */
+/* Expander styling for collapsible cards */
+[data-testid="stExpander"] {
+  background: var(--bg1) !important;
+  border: 1px solid var(--bdr) !important;
+  border-radius: 18px !important;
+  margin-bottom: 16px !important;
+  overflow: hidden !important;
+}
+[data-testid="stExpander"] details {
+  border: none !important;
+}
+[data-testid="stExpander"] summary {
+  padding: 18px 24px !important;
+  font-family: 'Space Grotesk', sans-serif !important;
+}
+[data-testid="stExpander"] summary span p {
+  font-size: 15px !important; font-weight: 700 !important;
+  color: var(--text) !important;
+}
+[data-testid="stExpander"] > div > div {
+  padding: 0 24px 24px !important;
+}
+
 div[data-testid="stNumberInput"] input,
 div[data-testid="stTextInput"] input {
   background: var(--bg2) !important; border: 1px solid var(--bdr) !important;
@@ -212,7 +262,6 @@ div[data-testid="stSelectbox"] label {
   color: var(--muted) !important;
 }
 
-/* Buttons */
 .stButton > button {
   background: var(--bg2) !important; border: 1px solid var(--bdr) !important;
   color: var(--text) !important; font-family: 'Space Grotesk', sans-serif !important;
@@ -230,7 +279,6 @@ div[data-testid="stSelectbox"] label {
   border-radius: 10px !important; font-family: 'Space Grotesk', sans-serif !important;
 }
 
-/* ── Page header ── */
 .ph {
   display: flex; align-items: center; justify-content: space-between;
   padding: 20px 0 24px; border-bottom: 1px solid var(--bdr); margin-bottom: 28px;
@@ -244,31 +292,14 @@ div[data-testid="stSelectbox"] label {
   padding: 10px 20px; border-radius: 10px; letter-spacing: 2px;
 }
 
-/* ── Ticker card ── */
-.ecard {
-  background: var(--bg1); border: 1px solid var(--bdr);
-  border-radius: 18px; padding: 28px 32px; margin-bottom: 24px;
-  position: relative; overflow: hidden;
-}
-.ecard::before {
-  content: ''; position: absolute; top: 0; left: 0;
-  width: 5px; height: 100%; border-radius: 18px 0 0 18px;
-}
-.ecard.green::before { background: var(--grn); }
-.ecard.red::before   { background: var(--red); }
-.ecard.yellow::before { background: var(--yel); }
-
 .ec-head { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 24px; }
-.ec-name { font-size: 36px; font-weight: 700; color: #fff; letter-spacing: 2px; }
-.ec-meta { font-size: 14px; color: var(--muted); margin-top: 6px; font-weight: 500; }
+.ec-meta { font-size: 14px; color: var(--muted); margin-top: 2px; font-weight: 500; }
 
-/* ── Badge ── */
-.bdg { font-size: 12px; font-weight: 700; letter-spacing: .5px; padding: 7px 16px; border-radius: 8px; text-transform: uppercase; }
+.bdg { font-size: 12px; font-weight: 700; letter-spacing: .5px; padding: 7px 16px; border-radius: 8px; text-transform: uppercase; display: inline-block; }
 .bdg.green  { background: rgba(34,197,94,.12);  color: var(--grn); border: 1px solid rgba(34,197,94,.35); }
 .bdg.red    { background: rgba(239,68,68,.12);   color: var(--red); border: 1px solid rgba(239,68,68,.35); }
 .bdg.yellow { background: rgba(234,179,8,.12);   color: var(--yel); border: 1px solid rgba(234,179,8,.35); }
 
-/* ── Metric row ── */
 .mrow { display: grid; grid-template-columns: repeat(5, 1fr); gap: 14px; margin-bottom: 24px; }
 .mc { background: var(--bg2); border: 1px solid var(--bdr); border-radius: 14px; padding: 18px 20px; }
 .mc-lbl { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); }
@@ -280,30 +311,31 @@ div[data-testid="stSelectbox"] label {
 .cy { color: var(--yel) !important; }
 .ca { color: var(--acc) !important; }
 
-/* ── Progress bar ── */
 .pbar { margin-bottom: 24px; }
 .pbar-track { height: 10px; background: var(--bg3); border-radius: 999px; position: relative; overflow: hidden; }
 .pbar-t { position: absolute; height: 10px; top: 0; left: 0; border-radius: 999px; background: var(--bg3); }
 .pbar-a { position: absolute; height: 10px; top: 0; left: 0; border-radius: 999px; opacity: .9; }
 .pbar-lbl { display: flex; justify-content: space-between; font-size: 13px; font-weight: 600; color: var(--muted); margin-top: 8px; }
 
-/* ── TWAP panels ── */
-.tpanels { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
-.tpanel { background: var(--bg2); border: 1px solid var(--bdr); border-radius: 14px; padding: 22px 24px; }
-.tp-title { font-size: 11px; font-weight: 700; letter-spacing: 1px; color: var(--acc); text-transform: uppercase; margin-bottom: 16px; }
-.trow { display: flex; justify-content: space-between; align-items: center; padding: 9px 0; border-bottom: 1px solid var(--bg3); }
-.trow:last-child { border-bottom: none; padding-top: 14px; margin-top: 6px; }
-.tk { font-size: 14px; color: var(--muted); }
-.tv { font-family: 'JetBrains Mono', monospace; font-size: 15px; font-weight: 600; color: var(--text); }
-.tv.big { font-size: 26px; font-weight: 700; }
+/* Excel table */
+.xtbl { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 13px; border: 1px solid var(--bdr); border-radius: 12px; overflow: hidden; margin-bottom: 16px; }
+.xtbl caption { caption-side: top; text-align: left; font-size: 11px; font-weight: 700; letter-spacing: 1px; color: var(--acc); text-transform: uppercase; padding: 0 0 10px 4px; }
+.xtbl th { padding: 10px 14px; font-size: 11px; font-weight: 700; letter-spacing: .5px; color: var(--muted); text-transform: uppercase; background: var(--bg2); border-bottom: 1px solid var(--bdr); text-align: left; white-space: nowrap; }
+.xtbl td { padding: 10px 14px; color: var(--text); border-bottom: 1px solid var(--bg3); white-space: nowrap; }
+.xtbl tr:last-child td { border-bottom: none; }
+.xtbl .xref { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--muted); font-weight: 600; }
+.xtbl .xval { font-family: 'JetBrains Mono', monospace; font-size: 14px; font-weight: 600; color: var(--text); text-align: right; }
+.xtbl .xbig { font-size: 18px; font-weight: 700; }
+.xtbl .xform { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: #7b85a0; }
+.xtbl tr.xhigh td { background: rgba(249,115,22,.06); border-top: 1px solid var(--bdr); }
 
-/* ── KPI strip ── */
+.tpanels { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+
 .kstrip { display: grid; grid-template-columns: repeat(4,1fr); gap: 14px; margin-bottom: 28px; }
 .kc { background: var(--bg1); border: 1px solid var(--bdr); border-radius: 16px; padding: 22px 24px; text-align: center; }
 .kc-lbl { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); }
 .kc-val { font-size: 48px; font-weight: 700; margin-top: 8px; font-family: 'JetBrains Mono', monospace; }
 
-/* ── Dashboard table ── */
 .dtbl { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 14px; border: 1px solid var(--bdr); border-radius: 14px; overflow: hidden; }
 .dtbl thead th { padding: 14px 18px; font-size: 11px; font-weight: 700; letter-spacing: .5px; color: var(--muted); text-transform: uppercase; background: var(--bg2); border-bottom: 1px solid var(--bdr); text-align: right; white-space: nowrap; }
 .dtbl thead th.tl { text-align: left; }
@@ -313,11 +345,7 @@ div[data-testid="stSelectbox"] label {
 .dtbl tbody tr:last-child td { border-bottom: none; }
 .dtbl tfoot td { padding: 14px 18px; text-align: right; font-weight: 700; font-size: 16px; border-top: 1px solid var(--bdr); background: var(--bg2); }
 
-/* ── Asignado input label ── */
-.inp-label {
-  font-size: 12px; font-weight: 700; text-transform: uppercase;
-  letter-spacing: .5px; color: var(--muted); margin-bottom: 6px;
-}
+.inp-label { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); margin-bottom: 6px; }
 .inp-hint { color: var(--acc); font-weight: 400; font-size: 11px; }
 
 [data-testid="stInfo"] { font-size: 14px !important; border-radius: 12px !important; }
@@ -327,13 +355,11 @@ pre, code { font-family: 'JetBrains Mono', monospace !important; font-size: 13px
 
 # ─── Load data ────────────────────────────────────────────────────────────────
 emisoras = load_emisoras()
-
-# ══ FIX 3: Hora siempre en tiempo real CDMX ══
 ahora_real = now_cdmx()
 
 # ─── SIDEBAR ─────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.markdown(f"""
+    st.markdown("""
     <div style='font-size:22px;font-weight:700;color:var(--text);padding:4px 0 2px;'>
       ▸ TWAP <span style='color:#f97316;'>Monitor</span>
     </div>
@@ -354,7 +380,7 @@ with st.sidebar:
         ahora = datetime.combine(fecha_ref, hora_ref)
 
     st.markdown(f"""
-    <div style='font-family:JetBrains Mono,monospace;font-size:24px;font-weight:700;
+    <div id='sidebar-clock' style='font-family:JetBrains Mono,monospace;font-size:24px;font-weight:700;
         color:#f97316;background:#1c2030;border:1px solid #2e3348;
         border-radius:10px;padding:10px 16px;text-align:center;margin:8px 0;
         letter-spacing:2px;'>
@@ -408,17 +434,38 @@ with st.sidebar:
 st.markdown(f"""
 <div class='ph'>
   <div class='ph-title'>TWAP <em>Monitor</em> &nbsp;<span style='font-size:16px;color:#7b85a0;font-weight:500;'>Mesa de Capitales</span></div>
-  <div class='ph-clock'>{ahora.strftime('%H:%M:%S')}</div>
+  <div class='ph-clock' id='header-clock'>{ahora.strftime('%H:%M:%S')}</div>
 </div>
 """, unsafe_allow_html=True)
 
-# ── Auto-refresh cada 30 segundos (JS que sí funciona en Streamlit) ────────
+# ════════════════════════════════════════════════════════════════════════════
+# FIX 3: RELOJ EN TIEMPO REAL cada segundo + page refresh cada 60s
+# ════════════════════════════════════════════════════════════════════════════
 st.markdown("""
 <script>
 (function() {
+  function getCDMXTime() {
+    var now = new Date();
+    var utc = now.getTime() + now.getTimezoneOffset() * 60000;
+    return new Date(utc - 6 * 3600000);
+  }
+  function pad(n) { return String(n).padStart(2, '0'); }
+  function updateClocks() {
+    var cdmx = getCDMXTime();
+    var t = pad(cdmx.getHours()) + ':' + pad(cdmx.getMinutes()) + ':' + pad(cdmx.getSeconds());
+    var hc = document.getElementById('header-clock');
+    if (hc) hc.textContent = t;
+    var sc = document.getElementById('sidebar-clock');
+    if (sc) sc.textContent = t;
+  }
+  if (!window._twapClock) {
+    window._twapClock = setInterval(updateClocks, 1000);
+    updateClocks();
+  }
+  // Refresh completo cada 60s para recalcular TWAP
   if (!window._twapRefresh) {
     window._twapRefresh = true;
-    setTimeout(function(){ window.location.reload(); }, 30000);
+    setTimeout(function(){ window.location.reload(); }, 60000);
   }
 })();
 </script>
@@ -426,14 +473,14 @@ st.markdown("""
 
 tab1, tab2, tab3 = st.tabs(["📊  MONITOR", "📈  DASHBOARD", "📋  CONFIRMACIÓN"])
 
+color_hex = {"green": "#22c55e", "red": "#ef4444", "yellow": "#eab308"}
+
 # ════════════════════════════════════════════════════════════════════════════
-# TAB 1 — MONITOR
+# TAB 1 — MONITOR (FIX 2: pestañas colapsables)
 # ════════════════════════════════════════════════════════════════════════════
 with tab1:
     if not emisoras:
         st.info("Sin emisoras. Agrega una desde el panel izquierdo ← (sidebar).")
-
-    color_hex = {"green": "#22c55e", "red": "#ef4444", "yellow": "#eab308"}
 
     for idx, e in enumerate(emisoras):
         r = calc_twap(e, ahora)
@@ -446,112 +493,116 @@ with tab1:
         pct_a = min(r["pct_asig"]   * 100, 100)
         faltante = e["vol_original"] - e["asignado"]
 
-        st.markdown(f"""
-        <div class='ecard {cls}'>
-          <div class='ec-head'>
-            <div>
-              <div class='ec-name'>{e['nombre']}</div>
-              <div class='ec-meta'>
-                {e['fondo']} &nbsp;·&nbsp; {e['tipo']}
-                &nbsp;·&nbsp; {e['hora_orden'][:5]} → {e['hora_meta'][:5]}
-                &nbsp;·&nbsp; Periodo {e['mins_periodo']} min
+        tipo_icon = "🟢" if e["tipo"] == "COMPRA" else "🔴"
+        status_icon = {"green": "✅", "red": "🔻", "yellow": "🟡"}[cls]
+
+        expander_title = f"{tipo_icon}  **{e['nombre']}**  ·  {e['tipo']}  ·  {lbl}  {status_icon}  ·  Por Asignar: **{signed(r['por_asignar_min'])}**"
+
+        with st.expander(expander_title, expanded=False):
+            st.markdown(f"""
+            <div class='ec-head'>
+              <div>
+                <div class='ec-meta'>
+                  {e['fondo']} &nbsp;·&nbsp;
+                  {e['hora_orden'][:5]} → {e['hora_meta'][:5]}
+                  &nbsp;·&nbsp; Periodo {e['mins_periodo']} min
+                </div>
+              </div>
+              <span class='bdg {cls}'>{lbl}</span>
+            </div>
+            """, unsafe_allow_html=True)
+
+            st.markdown(f"""
+            <div class='mrow'>
+              <div class='mc'><div class='mc-lbl'>Vol. Original</div><div class='mc-val cw'>{e['vol_original']:,}</div><div class='mc-sub'>títulos totales</div></div>
+              <div class='mc'><div class='mc-lbl'>Asignado</div><div class='mc-val' style='color:{bc};'>{e['asignado']:,}</div><div class='mc-sub'>{pct_a:.1f}% del total</div></div>
+              <div class='mc'><div class='mc-lbl'>TWAP Esperado</div><div class='mc-val ca'>{r['twap_min']:,.0f}</div><div class='mc-sub'>deberías llevar</div></div>
+              <div class='mc'><div class='mc-lbl'>Tiempo Trans.</div><div class='mc-val cw'>{pct_t:.1f}%</div><div class='mc-sub'>{r['c12']} / {r['mins_total']:.0f} min</div></div>
+              <div class='mc'><div class='mc-lbl'>Sin Asignar</div><div class='mc-val {"cg" if faltante == 0 else "cr"}'>{faltante:,}</div><div class='mc-sub'>títulos restantes</div></div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            st.markdown(f"""
+            <div class='pbar'>
+              <div class='pbar-track'>
+                <div class='pbar-t' style='width:{pct_t:.2f}%;background:#252a3a;'></div>
+                <div class='pbar-a' style='width:{pct_a:.2f}%;background:{bc};'></div>
+              </div>
+              <div class='pbar-lbl'>
+                <span>⬛ Tiempo {pct_t:.1f}%</span>
+                <span style='color:{bc};'>● Asignado {pct_a:.1f}%</span>
               </div>
             </div>
-            <span class='bdg {cls}'>{lbl}</span>
-          </div>
+            """, unsafe_allow_html=True)
 
-          <div class='mrow'>
-            <div class='mc'>
-              <div class='mc-lbl'>Vol. Original</div>
-              <div class='mc-val cw'>{e['vol_original']:,}</div>
-              <div class='mc-sub'>títulos totales</div>
-            </div>
-            <div class='mc'>
-              <div class='mc-lbl'>Asignado</div>
-              <div class='mc-val' style='color:{bc};'>{e['asignado']:,}</div>
-              <div class='mc-sub'>{pct_a:.1f}% del total</div>
-            </div>
-            <div class='mc'>
-              <div class='mc-lbl'>TWAP Esperado</div>
-              <div class='mc-val ca'>{r['twap_min']:,.0f}</div>
-              <div class='mc-sub'>deberías llevar</div>
-            </div>
-            <div class='mc'>
-              <div class='mc-lbl'>Tiempo Trans.</div>
-              <div class='mc-val cw'>{pct_t:.1f}%</div>
-              <div class='mc-sub'>{r['c12']} / {r['mins_total']:.0f} min</div>
-            </div>
-            <div class='mc'>
-              <div class='mc-lbl'>Sin Asignar</div>
-              <div class='mc-val {"cg" if faltante == 0 else "cr"}'>{faltante:,}</div>
-              <div class='mc-sub'>títulos restantes</div>
-            </div>
-          </div>
+            # ══ FIX 4: TABLAS EXACTAS DEL EXCEL ══
+            st.markdown(f"""
+            <div class='tpanels'>
+              <table class='xtbl'>
+                <caption>⏱ TWAP × MINUTOS</caption>
+                <thead><tr><th>Celda</th><th>Concepto</th><th>Fórmula Excel</th><th style='text-align:right;'>Valor</th></tr></thead>
+                <tbody>
+                  <tr><td class='xref'>B5</td><td>Emisora</td><td class='xform'></td><td class='xval'>{e['nombre']}</td></tr>
+                  <tr><td class='xref'>C6</td><td>Hora Orden</td><td class='xform'></td><td class='xval'>{e['hora_orden']}</td></tr>
+                  <tr><td class='xref'>C7</td><td>Vol. Original</td><td class='xform'></td><td class='xval'>{e['vol_original']:,}</td></tr>
+                  <tr><td class='xref'>C8</td><td>Hora Meta</td><td class='xform'></td><td class='xval'>{e['hora_meta']}</td></tr>
+                  <tr><td class='xref'>C9</td><td>Tiempo Total</td><td class='xform'>=C8-C6</td><td class='xval'>{r['tiempo_total_hms']}</td></tr>
+                  <tr><td class='xref'>C10</td><td>Mins</td><td class='xform'>=(C8-C6)*1440</td><td class='xval'>{r['c10']:.4f}</td></tr>
+                  <tr><td class='xref'>C11</td><td>Tiempo Trans.</td><td class='xform'>=NOW()-C6</td><td class='xval'>{r['tiempo_trans_hms']}</td></tr>
+                  <tr><td class='xref'>C12</td><td>Mins</td><td class='xform'>=HOUR(C11)*60+MIN(C11)</td><td class='xval'>{r['c12']}</td></tr>
+                  <tr><td class='xref'>C13</td><td>TWAP</td><td class='xform'>=C7/C10*C12</td><td class='xval' style='color:var(--acc);'>{r['c13']:,.2f}</td></tr>
+                  <tr><td class='xref'>C14</td><td>Asignado</td><td class='xform'></td><td class='xval'>{e['asignado']:,}</td></tr>
+                  <tr class='xhigh'><td class='xref'>C15</td><td><b>Por Asignar</b></td><td class='xform'>=C13-C14</td><td class='xval xbig' style='color:{bc};'>{signed(r['c15'])}</td></tr>
+                </tbody>
+              </table>
 
-          <div class='pbar'>
-            <div class='pbar-track'>
-              <div class='pbar-t' style='width:{pct_t:.2f}%;background:#252a3a;'></div>
-              <div class='pbar-a' style='width:{pct_a:.2f}%;background:{bc};'></div>
+              <table class='xtbl'>
+                <caption>📦 TWAP × PERIODOS — {e['mins_periodo']} min</caption>
+                <thead><tr><th>Celda</th><th>Concepto</th><th>Fórmula Excel</th><th style='text-align:right;'>Valor</th></tr></thead>
+                <tbody>
+                  <tr><td class='xref'>F5</td><td>Mins × Periodo</td><td class='xform'></td><td class='xval'>{e['mins_periodo']}</td></tr>
+                  <tr><td class='xref'>F7</td><td>Hora Orden</td><td class='xform'>=C6</td><td class='xval'>{e['hora_orden']}</td></tr>
+                  <tr><td class='xref'>F8</td><td>Vol. Original</td><td class='xform'>=C7</td><td class='xval'>{e['vol_original']:,}</td></tr>
+                  <tr><td class='xref'>F9</td><td>Hora Meta</td><td class='xform'>=C8</td><td class='xval'>{e['hora_meta']}</td></tr>
+                  <tr><td class='xref'>F10</td><td>Tiempo Total</td><td class='xform'>=F9-F7</td><td class='xval'>{r['tiempo_total_hms']}</td></tr>
+                  <tr><td class='xref'>F11</td><td>Mins</td><td class='xform'>=(F9-F7)*1440</td><td class='xval'>{r['c10']:.4f}</td></tr>
+                  <tr><td class='xref'>F12</td><td>Tiempo Trans.</td><td class='xform'>=NOW()-F7</td><td class='xval'>{r['tiempo_trans_hms']}</td></tr>
+                  <tr><td class='xref'>F13</td><td>Mins</td><td class='xform'>=HOUR(F12)*60+MIN(F12)</td><td class='xval'>{r['c12']}</td></tr>
+                  <tr><td class='xref'>F14</td><td>Total Periodos</td><td class='xform'>=F11/F5</td><td class='xval'>{r['f14']:.4f}</td></tr>
+                  <tr><td class='xref'>F15</td><td>Vol por Periodo</td><td class='xform'>=F8/F14</td><td class='xval'>{r['f15']:,.2f}</td></tr>
+                  <tr><td class='xref'>F16</td><td>Transcurridos</td><td class='xform'>=ROUNDUP(F13/F5,0)</td><td class='xval'>{r['f16']}</td></tr>
+                  <tr><td class='xref'>F17</td><td>TWAP</td><td class='xform'>=F16*F15</td><td class='xval' style='color:var(--acc);'>{r['f17']:,.2f}</td></tr>
+                  <tr><td class='xref'>F18</td><td>Asignado</td><td class='xform'>=C14</td><td class='xval'>{e['asignado']:,}</td></tr>
+                  <tr><td class='xref'>F19</td><td>(en periodos)</td><td class='xform'>=F18/F15</td><td class='xval'>{r['f19']:.4f}</td></tr>
+                  <tr class='xhigh'><td class='xref'>F20</td><td><b>Por Asignar</b></td><td class='xform'>=F17-F18</td><td class='xval xbig' style='color:{bcp};'>{signed(r['f20'])}</td></tr>
+                </tbody>
+              </table>
             </div>
-            <div class='pbar-lbl'>
-              <span>⬛ Tiempo {pct_t:.1f}%</span>
-              <span style='color:{bc};'>● Asignado {pct_a:.1f}%</span>
+            """, unsafe_allow_html=True)
+
+            st.markdown(f"""
+            <div class='inp-label'>
+              ✏️ Actualizar Asignado — {e['nombre']}
+              <span class='inp-hint'>&nbsp; Presiona Enter para guardar</span>
             </div>
-          </div>
+            """, unsafe_allow_html=True)
 
-          <div class='tpanels'>
-            <div class='tpanel'>
-              <div class='tp-title'>⏱ TWAP × Minutos</div>
-              <div class='trow'><span class='tk'>Mins totales (C10)</span><span class='tv'>{r['mins_total']:.2f}</span></div>
-              <div class='trow'><span class='tk'>Mins transcurridos (C12)</span><span class='tv'>{r['c12']}</span></div>
-              <div class='trow'><span class='tk'>TWAP esperado (C13)</span><span class='tv'>{r['twap_min']:,.0f}</span></div>
-              <div class='trow'><span class='tk'>Asignado (C14)</span><span class='tv'>{e['asignado']:,}</span></div>
-              <div class='trow'>
-                <span class='tk' style='color:#eef0f8;font-size:16px;font-weight:700;'>Por Asignar (C15)</span>
-                <span class='tv big' style='color:{bc};'>{signed(r["por_asignar_min"])}</span>
-              </div>
-            </div>
-            <div class='tpanel'>
-              <div class='tp-title'>📦 TWAP × Periodos — {e['mins_periodo']} min</div>
-              <div class='trow'><span class='tk'>Total periodos (F14)</span><span class='tv'>{r['total_periodos']:.2f}</span></div>
-              <div class='trow'><span class='tk'>Vol por periodo (F15)</span><span class='tv'>{r['vol_por_periodo']:,.0f}</span></div>
-              <div class='trow'><span class='tk'>Periodos ROUNDUP (F16)</span><span class='tv'>{r['periodos_trans']}</span></div>
-              <div class='trow'><span class='tk'>TWAP esperado (F17)</span><span class='tv'>{r['twap_per']:,.0f}</span></div>
-              <div class='trow'><span class='tk'>Asignado en periodos (F19)</span><span class='tv'>{r['asig_en_periodos']:.2f}</span></div>
-              <div class='trow'>
-                <span class='tk' style='color:#eef0f8;font-size:16px;font-weight:700;'>Por Asignar (F20)</span>
-                <span class='tv big' style='color:{bcp};'>{signed(r["por_asignar_per"])}</span>
-              </div>
-            </div>
-          </div>
-        </div>
-        """, unsafe_allow_html=True)
+            def make_cb(i):
+                def _cb():
+                    emisoras[i]["asignado"] = int(st.session_state[f"ai_{i}"])
+                    save_emisoras(emisoras)
+                return _cb
 
-        # ── Actualizar Asignado — Enter guarda automáticamente ─────────────
-        st.markdown(f"""
-        <div class='inp-label'>
-          ✏️ Actualizar Asignado — {e['nombre']}
-          <span class='inp-hint'>&nbsp; Presiona Enter para guardar</span>
-        </div>
-        """, unsafe_allow_html=True)
-
-        def make_cb(i):
-            def _cb():
-                emisoras[i]["asignado"] = int(st.session_state[f"ai_{i}"])
-                save_emisoras(emisoras)
-            return _cb
-
-        st.number_input(
-            f"_asig_{idx}",
-            min_value=0,
-            max_value=e["vol_original"],
-            value=e["asignado"],
-            step=100,
-            key=f"ai_{idx}",
-            on_change=make_cb(idx),
-            label_visibility="collapsed",
-        )
-        st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
+            st.number_input(
+                f"_asig_{idx}",
+                min_value=0,
+                max_value=e["vol_original"],
+                value=e["asignado"],
+                step=100,
+                key=f"ai_{idx}",
+                on_change=make_cb(idx),
+                label_visibility="collapsed",
+            )
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -675,15 +726,15 @@ with tab3:
         """, unsafe_allow_html=True)
 
         st.markdown("<div style='font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:#7b85a0;margin:28px 0 10px;'>Formato Bloomberg (Tab-separated)</div>", unsafe_allow_html=True)
-        st.info("Selecciona todo → **Ctrl+A** → **Ctrl+C** → pega en **Bloomberg MSG** o **Excel**. Los tabuladores lo convierten en tabla automáticamente.", icon="ℹ️")
+        st.info("Selecciona todo → **Ctrl+A** → **Ctrl+C** → pega en **Bloomberg MSG** o **Excel**.", icon="ℹ️")
 
-        header = "\t".join(["FONDO", "OPERACION", "EMISORA", "TITULOS", "PRECIO", "NOCIONAL"])
+        header_tsv = "\t".join(["FONDO", "OPERACION", "EMISORA", "TITULOS", "PRECIO", "NOCIONAL"])
         lines = []
         for e in emisoras:
             px  = precios.get(e["nombre"], 0.0)
             noc = e["asignado"] * px
             lines.append("\t".join([e["fondo"], e["tipo"], e["nombre"], f"{e['asignado']:,}", f"{px:.4f}", f"{noc:.2f}"]))
-        tsv = "\n".join([header] + lines + ["\t".join(["","","","","TOTAL",f"{total_noc:.2f}"])])
+        tsv = "\n".join([header_tsv] + lines + ["\t".join(["","","","","TOTAL",f"{total_noc:.2f}"])])
 
         st.code(tsv, language=None)
         st.download_button("⬇  Descargar .TSV (Excel / Bloomberg)",
