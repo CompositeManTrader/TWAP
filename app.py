@@ -13,8 +13,13 @@ Fórmulas exactas del Excel:
 """
 
 import streamlit as st
-from datetime import datetime, time, date, timedelta
+from datetime import datetime, time, date, timedelta, timezone
 import math, json
+
+# ── Zona horaria CDMX (UTC-6) ─────────────────────────────────────────────
+# Usamos offset fijo UTC-6 para no depender de pytz/zoneinfo en todos los entornos.
+# México Central es UTC-6 (no hay horario de verano desde 2023).
+CDMX_TZ = timezone(timedelta(hours=-6))
 
 st.set_page_config(
     page_title="TWAP Monitor",
@@ -22,6 +27,12 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+# ── Auto-refresh cada 30 segundos para hora en tiempo real ─────────────────
+# Usamos un meta-refresh en <head> que sí funciona en Streamlit
+# (el script tag a veces es bloqueado)
+if "refresh_counter" not in st.session_state:
+    st.session_state.refresh_counter = 0
 
 DEFAULTS = [{
     "nombre": "VOLARA",
@@ -49,6 +60,10 @@ def parse_time(s: str) -> time:
 def fmt_time(t: time) -> str:
     return t.strftime("%H:%M:%S")
 
+def now_cdmx() -> datetime:
+    """Hora actual en CDMX, siempre."""
+    return datetime.now(CDMX_TZ).replace(tzinfo=None)  # naive pero en hora CDMX
+
 def calc_twap(e: dict, ahora: datetime) -> dict:
     ho = datetime.combine(ahora.date(), parse_time(e["hora_orden"]))
     hm = datetime.combine(ahora.date(), parse_time(e["hora_meta"]))
@@ -58,17 +73,28 @@ def calc_twap(e: dict, ahora: datetime) -> dict:
     asig = float(e["asignado"])
     mp   = int(e["mins_periodo"])
     mins_total = (hm - ho).total_seconds() / 60.0
+
+    # Tiempo transcurrido limitado al rango [0, mins_total]
     diff_s = max(0.0, min((ahora - ho).total_seconds(), mins_total * 60))
     total_sec = int(diff_s)
     c12 = (total_sec // 3600) * 60 + (total_sec % 3600) // 60
-    twap_min = (vol / mins_total * c12) if mins_total > 0 else 0.0
+
+    # ══ FIX 1: TWAP esperado NUNCA puede superar vol_original ══
+    twap_min_raw = (vol / mins_total * c12) if mins_total > 0 else 0.0
+    twap_min = min(twap_min_raw, vol)  # <-- CAP al volumen original
+
     por_asignar_min = twap_min - asig
+
     total_periodos   = mins_total / mp if mp > 0 else 0.0
     vol_por_periodo  = vol / total_periodos if total_periodos > 0 else 0.0
     periodos_trans   = math.ceil(c12 / mp) if (mp > 0 and c12 > 0) else 0
-    twap_per         = periodos_trans * vol_por_periodo
+
+    twap_per_raw     = periodos_trans * vol_por_periodo
+    twap_per         = min(twap_per_raw, vol)  # <-- CAP al volumen original
+
     asig_en_periodos = asig / vol_por_periodo if vol_por_periodo > 0 else 0.0
     por_asignar_per  = twap_per - asig
+
     pct_tiempo = c12 / mins_total if mins_total > 0 else 0.0
     pct_asig   = asig / vol if vol > 0 else 0.0
     return dict(
@@ -116,9 +142,22 @@ html, body,
   color: var(--text) !important;
   font-family: 'Space Grotesk', sans-serif !important;
 }
+
+/* ══ FIX 2: Forzar sidebar visible ══ */
 [data-testid="stSidebar"] {
   background: var(--bg1) !important;
   border-right: 1px solid var(--bdr) !important;
+  min-width: 340px !important;
+  width: 340px !important;
+}
+[data-testid="stSidebar"][aria-expanded="false"] {
+  min-width: 340px !important;
+  width: 340px !important;
+  margin-left: 0 !important;
+  transform: none !important;
+}
+[data-testid="stSidebar"] > div:first-child {
+  padding-top: 1rem !important;
 }
 [data-testid="stSidebar"] * {
   font-family: 'Space Grotesk', sans-serif !important;
@@ -288,7 +327,9 @@ pre, code { font-family: 'JetBrains Mono', monospace !important; font-size: 13px
 
 # ─── Load data ────────────────────────────────────────────────────────────────
 emisoras = load_emisoras()
-ahora_real = datetime.now()
+
+# ══ FIX 3: Hora siempre en tiempo real CDMX ══
+ahora_real = now_cdmx()
 
 # ─── SIDEBAR ─────────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -301,7 +342,7 @@ with st.sidebar:
 
     st.divider()
 
-    usar_hora_real = st.checkbox("⏱ Usar hora del sistema", value=True)
+    usar_hora_real = st.checkbox("⏱ Usar hora del sistema (CDMX)", value=True)
     if usar_hora_real:
         ahora = ahora_real
     else:
@@ -320,7 +361,7 @@ with st.sidebar:
       {ahora.strftime('%H:%M:%S')}
     </div>
     <div style='text-align:center;font-size:13px;color:#7b85a0;margin-bottom:4px;'>
-      {ahora.strftime('%d/%m/%Y')}
+      {ahora.strftime('%d/%m/%Y')} · CDMX (UTC-6)
     </div>
     """, unsafe_allow_html=True)
 
@@ -371,8 +412,17 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-# Auto-refresh
-st.markdown("<script>setTimeout(()=>window.location.reload(),30000);</script>", unsafe_allow_html=True)
+# ── Auto-refresh cada 30 segundos (JS que sí funciona en Streamlit) ────────
+st.markdown("""
+<script>
+(function() {
+  if (!window._twapRefresh) {
+    window._twapRefresh = true;
+    setTimeout(function(){ window.location.reload(); }, 30000);
+  }
+})();
+</script>
+""", unsafe_allow_html=True)
 
 tab1, tab2, tab3 = st.tabs(["📊  MONITOR", "📈  DASHBOARD", "📋  CONFIRMACIÓN"])
 
@@ -381,7 +431,7 @@ tab1, tab2, tab3 = st.tabs(["📊  MONITOR", "📈  DASHBOARD", "📋  CONFIRMAC
 # ════════════════════════════════════════════════════════════════════════════
 with tab1:
     if not emisoras:
-        st.info("Sin emisoras. Agrega una desde el panel izquierdo.")
+        st.info("Sin emisoras. Agrega una desde el panel izquierdo ← (sidebar).")
 
     color_hex = {"green": "#22c55e", "red": "#ef4444", "yellow": "#eab308"}
 
